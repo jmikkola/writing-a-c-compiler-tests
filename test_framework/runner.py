@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
 import platform
 import subprocess
+import sys
+import threading
+import time
 import unittest
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from functools import reduce
 from operator import ior
 from pathlib import Path
-from typing import Iterable, Optional, List, Type
+from typing import Iterable, Iterator, Optional, List, Type
 
 import test_framework
 import test_framework.basic
@@ -109,6 +114,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--failfast", "-f", action="store_true", help="Stop on first test failure"
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=os.cpu_count() or 1,
+        metavar="N",
+        help="Number of tests to run in parallel (default: number of CPU cores; pass 1 to disable parallelism).",
     )
     parser.add_argument("--verbose", "-v", action="count", default=0)
     parser.add_argument(
@@ -276,6 +289,9 @@ def parse_arguments() -> argparse.Namespace:
     if args.no_coalescing and args.chapter < TACKY_OPT_CHAPTER:
         warnings.warn("Option --no-coalescing has no impact on Part I & Part II tests")
 
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+
     if args.expected_error_codes:
         out_of_range = [str(i) for i in args.expected_error_codes if i < 1 or i > 255]
         if out_of_range:
@@ -435,6 +451,154 @@ def gen_assembly(failure_case: test_framework.basic.TestChapter) -> None:
     subprocess.run(compiler_args, check=False, text=True, capture_output=True)
 
 
+_DOT_CHARS = {
+    "ok": ".",
+    "ERROR": "E",
+    "FAIL": "F",
+    "skipped": "s",
+    "expected failure": "x",
+    "unexpected success": "u",
+}
+
+
+class _ParallelTextTestResult(unittest.TextTestResult):
+    """TextTestResult variant where each test's status line is emitted atomically.
+
+    The base class writes 'name ... ' on startTest and 'ok' / 'FAIL' / 'ERROR' on
+    completion as separate operations. With concurrent tests that interleaves badly,
+    so we suppress the start-of-test write and emit the full line under a lock when
+    the test finishes."""
+
+    def __init__(self, stream, descriptions, verbosity):  # type: ignore[no-untyped-def]
+        super().__init__(stream, descriptions, verbosity)
+        self._lock = threading.Lock()
+
+    def startTest(self, test: unittest.TestCase) -> None:
+        # Bypass TextTestResult.startTest, which would write 'name ... ' immediately.
+        with self._lock:
+            unittest.TestResult.startTest(self, test)
+
+    def _emit(self, test: unittest.TestCase, status: str) -> None:
+        if self.showAll:
+            self.stream.writeln(f"{self.getDescription(test)} ... {status}")
+        elif self.dots:
+            # status may have a trailing reason for skip; key off the first word
+            key = status.split(" ", 1)[0]
+            self.stream.write(_DOT_CHARS.get(key, "?"))
+            self.stream.flush()
+
+    def addSuccess(self, test: unittest.TestCase) -> None:
+        with self._lock:
+            unittest.TestResult.addSuccess(self, test)
+            self._emit(test, "ok")
+
+    def addError(self, test, err) -> None:  # type: ignore[no-untyped-def]
+        with self._lock:
+            unittest.TestResult.addError(self, test, err)
+            self._emit(test, "ERROR")
+
+    def addFailure(self, test, err) -> None:  # type: ignore[no-untyped-def]
+        with self._lock:
+            unittest.TestResult.addFailure(self, test, err)
+            self._emit(test, "FAIL")
+
+    def addSkip(self, test: unittest.TestCase, reason: str) -> None:
+        with self._lock:
+            unittest.TestResult.addSkip(self, test, reason)
+            self._emit(test, f"skipped {reason!r}")
+
+    def addExpectedFailure(self, test, err) -> None:  # type: ignore[no-untyped-def]
+        with self._lock:
+            unittest.TestResult.addExpectedFailure(self, test, err)
+            self._emit(test, "expected failure")
+
+    def addUnexpectedSuccess(self, test: unittest.TestCase) -> None:
+        with self._lock:
+            unittest.TestResult.addUnexpectedSuccess(self, test)
+            self._emit(test, "unexpected success")
+
+
+def _flatten_suite(suite: unittest.TestSuite) -> Iterator[unittest.TestCase]:
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _flatten_suite(item)
+        else:
+            yield item
+
+
+def _print_summary(
+    stream: "unittest.runner._WritelnDecorator",
+    result: unittest.TestResult,
+    elapsed: float,
+) -> None:
+    """Print the failure/error tracebacks and final summary line, mimicking TextTestRunner."""
+    result.printErrors()
+    stream.writeln(result.separator2)
+    n = result.testsRun
+    stream.writeln(
+        f"Ran {n} test{'s' if n != 1 else ''} in {elapsed:.3f}s"
+    )
+    stream.writeln()
+
+    infos: List[str] = []
+    if not result.wasSuccessful():
+        stream.write("FAILED")
+        if result.failures:
+            infos.append(f"failures={len(result.failures)}")
+        if result.errors:
+            infos.append(f"errors={len(result.errors)}")
+    else:
+        stream.write("OK")
+    if result.skipped:
+        infos.append(f"skipped={len(result.skipped)}")
+    if result.expectedFailures:
+        infos.append(f"expected failures={len(result.expectedFailures)}")
+    if result.unexpectedSuccesses:
+        infos.append(f"unexpected successes={len(result.unexpectedSuccesses)}")
+    if infos:
+        stream.writeln(f" ({', '.join(infos)})")
+    else:
+        stream.write("\n")
+
+
+def run_tests(
+    suite: unittest.TestSuite,
+    *,
+    jobs: int,
+    verbosity: int,
+    failfast: bool,
+) -> unittest.TestResult:
+    """Run ``suite`` either serially or with up to ``jobs`` worker threads."""
+    stream = unittest.runner._WritelnDecorator(sys.stderr)  # type: ignore[attr-defined]
+    result = _ParallelTextTestResult(stream, descriptions=True, verbosity=verbosity)
+    result.failfast = failfast
+
+    unittest.signals.registerResult(result)
+
+    tests = list(_flatten_suite(suite))
+    start = time.time()
+
+    def run_one(test: unittest.TestCase) -> None:
+        if result.shouldStop:
+            return
+        test(result)
+
+    if jobs <= 1 or len(tests) <= 1:
+        for test in tests:
+            run_one(test)
+    else:
+        worker_count = min(jobs, len(tests))
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            # Use a list to ensure all submissions happen even if iteration is paused.
+            # shouldStop is checked inside run_one, so failfast still cuts off scheduled work.
+            for _ in ex.map(run_one, tests):
+                pass
+
+    elapsed = time.time() - start
+    _print_summary(stream, result, elapsed)
+    return result
+
+
 def main() -> int:
     """Main entry point for test runner"""
     args = parse_arguments()
@@ -518,8 +682,12 @@ def main() -> int:
     unittest.installHandler()
 
     # run it
-    runner = unittest.TextTestRunner(verbosity=args.verbose, failfast=args.failfast)
-    result = runner.run(test_suite)
+    result = run_tests(
+        test_suite,
+        jobs=args.jobs,
+        verbosity=args.verbose,
+        failfast=args.failfast,
+    )
     if result.wasSuccessful():
         return 0
 

@@ -62,22 +62,6 @@ class TestRegAlloc(basic.TestChapter):
         access the stack should both be below some upper bound
     """
 
-    def tearDown(self) -> None:
-        """Delete files produced during this test run (e.g. assembly and object files)
-
-        Don't delete the wrapper scripts!"""
-        garbage_files = (
-            f
-            for f in self.test_dir.rglob("*")
-            if not f.is_dir()
-            and f.suffix not in [".c", ".h"]
-            and f.stem not in ["wrapper_osx", "wrapper_linux"]
-            and f.name not in basic.ASSEMBLY_LIBS
-        )
-
-        for f in garbage_files:
-            f.unlink()
-
     def basic_test(self, program_path: Path) -> None:
         """Test that the compiled program behaves correctly but don't inspect the assembly code.
 

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import unittest_parallel; print\\(unittest_parallel.__file__\\)\")",
+      "Bash(pip show *)",
+      "Bash(pip3 install *)"
+    ]
+  }
+}

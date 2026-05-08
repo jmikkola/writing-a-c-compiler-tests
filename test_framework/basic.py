@@ -229,17 +229,38 @@ class TestChapter(unittest.TestCase):
     error_codes: list[int]
 
     def tearDown(self) -> None:
-        """Delete files produced during this test run (e.g. assembly and object files)"""
-        garbage_files = (
-            f
-            for f in self.test_dir.rglob("*")
-            if not f.is_dir()
-            and f.suffix not in [".c", ".h", ".md"]
-            and f.name not in ASSEMBLY_LIBS
-        )
+        """Delete files produced during this test run (e.g. assembly and object files).
 
-        for junk in garbage_files:
-            junk.unlink()
+        Only artifacts derived from the current test's source file are removed, so it's
+        safe to run tests in this directory concurrently."""
+        source_file = self._source_file_for_test()
+        parent = source_file.parent
+        if not parent.is_dir():
+            return
+        stem = source_file.stem
+        for f in parent.iterdir():
+            if f.is_dir():
+                continue
+            if f.suffix in [".c", ".h", ".md"]:
+                continue
+            if f.name in ASSEMBLY_LIBS:
+                continue
+            # match the bare executable (e.g. "foo") or any sibling like "foo.s",
+            # "foo.o", "foo.i" — but not "foobar.s", which would be a different test
+            if f.name == stem or f.name.startswith(stem + "."):
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _source_file_for_test(self) -> Path:
+        """Recover the path to the source file under test from the test method name.
+
+        Test methods are registered with names like 'test_valid/special_values/infinity',
+        which corresponds to '<test_dir>/valid/special_values/infinity.c'.
+        """
+        relative = self._testMethodName[len("test_"):] + ".c"
+        return (self.test_dir / relative).with_suffix(".c")
 
     def invoke_compiler(
         self, source_file: Path, cc_opt: Optional[str] = None
